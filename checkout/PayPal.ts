@@ -1,6 +1,7 @@
 import {
   ClientIDSecretCredentials,
   ParsedAuthorizationResponse,
+  ParsedCancelResponse,
   ParsedCaptureResponse,
   PayPalOrder,
   ProcessorConnection,
@@ -9,10 +10,64 @@ import {
   RawCaptureRequest,
 } from '@primer-io/app-framework';
 
-/**
- * Use the HTTP Client to make requests to PayPal's orders API
- */
 import HTTPClient from '../common/HTTPClient';
+
+const PAYPAL_API_BASE_URL = 'https://api-m.sandbox.paypal.com';
+
+interface PayPalAccessTokenResponse {
+  access_token: string;
+}
+
+interface PayPalAuthorizationResponse {
+  id: string;
+  status: string;
+  purchase_units?: Array<{
+    payments?: {
+      authorizations?: Array<{
+        id: string;
+        status: string;
+      }>;
+    };
+  }>;
+}
+
+async function getAccessToken(
+  clientId: string,
+  clientSecret: string,
+): Promise<string> {
+  const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString(
+    'base64',
+  );
+
+  const response = await HTTPClient.request(
+    `${PAYPAL_API_BASE_URL}/v1/oauth2/token`,
+    {
+      method: 'post',
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+    },
+  );
+
+  const parsedResponse = JSON.parse(
+    response.responseText,
+  ) as PayPalAccessTokenResponse;
+
+  if (response.statusCode >= 400 || !parsedResponse.access_token) {
+    throw new Error(`Unable to retrieve PayPal access token: ${response.responseText}`);
+  }
+
+  return parsedResponse.access_token;
+}
+
+function getBearerHeaders(accessToken: string): { [key: string]: string } {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+  };
+}
 
 const PayPalConnection: ProcessorConnection<
   ClientIDSecretCredentials,
@@ -23,39 +78,95 @@ const PayPalConnection: ProcessorConnection<
   website: 'https://paypal.com',
 
   configuration: {
-    accountId:
-      '... Paste something here that uniquely identifies the PayPal account',
-    clientId: '...Paste your sandbox PayPal client ID here...',
-    clientSecret: '...Paste your sandbox PayPal client secret here...',
+    accountId: 'paypal-sandbox',
+    clientId: process.env.PAYPAL_CLIENT_ID || '',
+    clientSecret: process.env.PAYPAL_CLIENT_SECRET || '',
   },
 
-  /**
-   * Authorize a PayPal order
-   * Use the HTTPClient and the request info to authorize a paypal order
-   */
-  authorize(
+  async authorize(
     request: RawAuthorizationRequest<ClientIDSecretCredentials, PayPalOrder>,
   ): Promise<ParsedAuthorizationResponse> {
-    throw new Error('Not Implemented');
+    const { processorConfig, paymentMethod } = request;
+
+    const accessToken = await getAccessToken(
+      processorConfig.clientId,
+      processorConfig.clientSecret,
+    );
+
+    const response = await HTTPClient.request(
+      `${PAYPAL_API_BASE_URL}/v2/checkout/orders/${paymentMethod.orderId}/authorize`,
+      {
+        method: 'post',
+        headers: getBearerHeaders(accessToken),
+        body: '{}',
+      },
+    );
+
+    const parsedResponse = JSON.parse(
+      response.responseText,
+    ) as PayPalAuthorizationResponse;
+
+    if (response.statusCode >= 400) {
+      return {
+        transactionStatus: 'FAILED',
+        errorMessage: response.responseText || 'PayPal authorization failed',
+      };
+    }
+
+    const authorization =
+      parsedResponse.purchase_units?.[0]?.payments?.authorizations?.[0];
+
+    if (authorization?.id) {
+      return {
+        transactionStatus: 'AUTHORIZED',
+        processorTransactionId: authorization.id,
+      };
+    }
+
+    return {
+      transactionStatus: 'FAILED',
+      errorMessage: `Unable to find PayPal authorization ID in response: ${response.responseText}`,
+    };
   },
 
-  /**
-   * Cancel a PayPal order
-   * Use the HTTPClient and the request information to cancel the PayPal order
-   */
-  cancel(
+  async cancel(
     request: RawCancelRequest<ClientIDSecretCredentials>,
-  ): Promise<ParsedCaptureResponse> {
-    throw new Error('Not Implemented');
+  ): Promise<ParsedCancelResponse> {
+    const { processorConfig, processorTransactionId } = request;
+
+    const accessToken = await getAccessToken(
+      processorConfig.clientId,
+      processorConfig.clientSecret,
+    );
+
+    const response = await HTTPClient.request(
+      `${PAYPAL_API_BASE_URL}/v2/payments/authorizations/${processorTransactionId}/void`,
+      {
+        method: 'post',
+        headers: getBearerHeaders(accessToken),
+        body: '{}',
+      },
+    );
+
+    if (response.statusCode === 204 || response.statusCode === 200) {
+      return {
+        transactionStatus: 'CANCELLED',
+      };
+    }
+
+    return {
+      transactionStatus: 'FAILED',
+      errorMessage: response.responseText || 'PayPal cancellation failed',
+    };
   },
 
-  /**
-   * Capture a PayPal order (You can ignore this method for the exercise)
-   */
-  capture(
+  async capture(
     request: RawCaptureRequest<ClientIDSecretCredentials>,
   ): Promise<ParsedCaptureResponse> {
-    throw new Error('Not Implemented');
+    return {
+      transactionStatus: 'FAILED',
+      errorMessage: 'Capture is not implemented for this exercise',
+    };
   },
 };
 
